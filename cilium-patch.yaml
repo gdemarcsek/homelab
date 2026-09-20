@@ -1,0 +1,7 @@
+devices:
+  - enx525400231b4e
+  - enx525400c8d436
+l2announcements:
+  enabled: true
+extraArgs:
+  - --direct-routing-device=enx525400c8d436

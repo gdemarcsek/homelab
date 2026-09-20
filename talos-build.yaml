@@ -1,0 +1,239 @@
+---
+- name: Bootstrap Hardware-Isolated Talos Enclave
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    vm_name: talos-k8s
+    talos_version: v1.7.6
+    lab_dir: "{{ lookup('env', 'HOME') }}/lab/talos"
+    iso_path: "/var/lib/libvirt/images/{{ vm_name }}.iso"
+    disk_path: "/var/lib/libvirt/images/{{ vm_name }}.qcow2"
+    phys_nic: "{{ ansible_default_ipv4.interface }}"
+
+  tasks:
+    - name: Pre-flight Sanity Checks
+      block:
+        - name: Assert host architecture is x86_64
+          assert:
+            that: ansible_architecture == 'x86_64'
+            fail_msg: "Talos playbook currently expects x86_64 architecture."
+
+        - name: Check Intel nested virtualization status
+          command: cat /sys/module/kvm_intel/parameters/nested
+          register: kvm_nested
+          changed_when: false
+
+        - name: Assert Intel nested virtualization is enabled
+          assert:
+            that: kvm_nested.stdout in ['Y', '1', 'y']
+            fail_msg: "Nested KVM is not enabled on the host. Please check kernel parameters."
+
+    - name: Ensure local lab directory exists for keys and configs
+      file:
+        path: "{{ lab_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Ensure strictly version-matched talosctl (v1.7.6) is installed
+      get_url:
+        url: "https://github.com/siderolabs/talos/releases/download/{{ talos_version }}/talosctl-linux-amd64"
+        dest: /usr/local/bin/talosctl
+        mode: '0755'
+      become: yes
+
+    - name: Request Custom ISO Schematic from Talos Image Factory
+      uri:
+        url: https://factory.talos.dev/schematics
+        method: POST
+        body_format: json
+        status_code: [200, 201]
+        body:
+          customization:
+            systemExtensions:
+              officialExtensions:
+                - siderolabs/gvisor
+                - siderolabs/kata-containers
+      register: factory_response
+
+    - name: Capture Image Factory ID
+      set_fact:
+        factory_id: "{{ factory_response.json.id }}"
+
+    - name: Download Custom Talos ISO
+      get_url:
+        url: "https://factory.talos.dev/image/{{ factory_id }}/{{ talos_version }}/metal-amd64.iso"
+        dest: "{{ iso_path }}"
+      become: yes
+
+    - name: Check if KVM Virtual Machine already exists
+      command: virsh domstate {{ vm_name }}
+      register: vm_state
+      ignore_errors: yes
+      changed_when: false
+      become: yes
+
+    - name: Provision KVM Virtual Machine (Skipped if already running)
+      command: >
+        virt-install
+        --virt-type kvm
+        --name {{ vm_name }}
+        --memory 32768
+        --vcpus 4
+        --cpu host-passthrough
+        --disk path={{ disk_path }},bus=virtio,size=40,format=qcow2
+        --cdrom {{ iso_path }}
+        --os-variant linux2022
+        --network default
+        --network type=direct,source={{ phys_nic }},source_mode=bridge,model=virtio
+        --graphics none
+        --noautoconsole
+      become: yes
+      when: vm_state.rc != 0
+
+    - name: Wait for VM to boot and acquire an IP address
+      shell: |
+        MAC=$(virsh domiflist {{ vm_name }} | awk '/default/ {print $5}')
+        virsh net-dhcp-leases default | grep -i "$MAC" | awk '{print $5}' | cut -d/ -f1
+      register: vm_ip_cmd
+      until: vm_ip_cmd.stdout != ""
+      retries: 30
+      delay: 5
+      become: yes
+      changed_when: false
+
+    - name: Capture VM IP Address
+      set_fact:
+        vm_ip: "{{ vm_ip_cmd.stdout }}"
+
+    - name: Check if cryptographic keys already exist
+      stat:
+        path: "{{ lab_dir }}/talosconfig"
+      register: talosconfig_stat
+
+    - name: Configuration and Bootstrap Sequence
+      when: not talosconfig_stat.stat.exists
+      block:
+        - name: Write patch configuration
+          copy:
+            dest: "{{ lab_dir }}/patch.yaml"
+            content: |
+              cluster:
+                allowSchedulingOnControlPlanes: true
+                network:
+                  cni:
+                    name: none
+                proxy:
+                  disabled: true
+              machine:
+                install:
+                  disk: /dev/vda
+                  image: factory.talos.dev/installer/{{ factory_id }}:{{ talos_version }}
+
+        - name: Generate cluster configuration
+          command: >
+            talosctl gen config talos-k8s https://{{ vm_ip }}:6443
+            --config-patch @patch.yaml
+          args:
+            chdir: "{{ lab_dir }}"
+
+        - name: Point local talosctl to the new VM
+          command: "talosctl config {{ item }} {{ vm_ip }}"
+          environment:
+            TALOSCONFIG: "{{ lab_dir }}/talosconfig"
+          loop:
+            - endpoint
+            - node
+
+        - name: Apply configuration (Flashes OS to disk)
+          command: "talosctl apply-config --insecure --nodes {{ vm_ip }} --file controlplane.yaml"
+          environment:
+            TALOSCONFIG: "{{ lab_dir }}/talosconfig"
+          args:
+            chdir: "{{ lab_dir }}"
+
+        - name: Wait for Talos to reboot and enforce mTLS
+          command: "talosctl version --nodes {{ vm_ip }}"
+          environment:
+            TALOSCONFIG: "{{ lab_dir }}/talosconfig"
+          register: api_check
+          until: api_check.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: Bootstrap the Kubernetes cluster (etcd initialization)
+          command: "talosctl bootstrap --nodes {{ vm_ip }}"
+          environment:
+            TALOSCONFIG: "{{ lab_dir }}/talosconfig"
+          args:
+            chdir: "{{ lab_dir }}"
+
+        - name: Extract kubeconfig for kubectl access
+          command: "talosctl kubeconfig ."
+          environment:
+            TALOSCONFIG: "{{ lab_dir }}/talosconfig"
+          args:
+            chdir: "{{ lab_dir }}"
+
+    - name: Post-deployment Validation & Networking
+      block:
+        - name: Wait for Kubernetes API to become responsive
+          command: kubectl --kubeconfig {{ lab_dir }}/kubeconfig get nodes
+          register: k8s_api
+          until: k8s_api.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: Verify Talos extensions (Kata & gVisor) are successfully loaded
+          shell: "talosctl get extensions --nodes {{ vm_ip }} | grep -E 'kata-containers|gvisor'"
+          environment:
+            TALOSCONFIG: "{{ lab_dir }}/talosconfig"
+          register: talos_extensions
+          changed_when: false
+          failed_when: >
+            'kata-containers' not in talos_extensions.stdout or
+            'gvisor' not in talos_extensions.stdout
+
+        - name: Add Cilium Helm repository
+          command: helm repo add cilium https://helm.cilium.io/
+          changed_when: false
+
+        - name: Update Helm repositories
+          command: helm repo update
+          changed_when: false
+
+        - name: Install Cilium via Helm
+          command: >
+            helm upgrade --install cilium cilium/cilium
+            --version 1.16.1
+            --namespace kube-system
+            --create-namespace
+            --kubeconfig {{ lab_dir }}/kubeconfig
+            --set ipam.mode=kubernetes
+            --set kubeProxyReplacement=true
+            --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}"
+            --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}"
+            --set cgroup.autoMount.enabled=false
+            --set cgroup.hostRoot=/sys/fs/cgroup
+            --set k8sServiceHost=localhost
+            --set k8sServicePort=7445
+            --set devices="{eth0,eth1}"
+            --set directRoutingDevice=eth0
+          register: cilium_install
+          changed_when: "'Release \"cilium\" does not exist. Installing it now.' in cilium_install.stdout or 'has been upgraded' in cilium_install.stdout"
+
+        - name: Wait for the Kubernetes node to become Ready (Cilium running)
+          command: kubectl --kubeconfig {{ lab_dir }}/kubeconfig get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}'
+          register: node_ready
+          until: node_ready.stdout == "True"
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: Verify node is healthy (kubectl describe)
+          command: "kubectl describe node"
+          environment:
+            KUBECONFIG: "{{ lab_dir }}/kubeconfig"
+          changed_when: false
