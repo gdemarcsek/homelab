@@ -12,7 +12,7 @@ metadata:
   name: default-l2-policy
 spec:
   interfaces:
-    - eth1 # This matches the macvtap interface we configured in Ansible
+    - enx525400000002
   externalIPs: true
   loadBalancerIPs: true
 

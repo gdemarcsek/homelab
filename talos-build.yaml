@@ -10,7 +10,11 @@
     iso_path: "/var/lib/libvirt/images/{{ vm_name }}.iso"
     disk_path: "/var/lib/libvirt/images/{{ vm_name }}.qcow2"
     phys_nic: "{{ ansible_default_ipv4.interface }}"
-
+    lb_ip_pool: "192.168.1.240/29"
+    mac_mgmt: "52:54:00:00:00:01"
+    mac_data: "52:54:00:00:00:02"
+    iface_mgmt: "enx525400000001"
+    iface_data: "enx525400000002"
   tasks:
     - name: Pre-flight Sanity Checks
       block:
@@ -28,6 +32,24 @@
           assert:
             that: kvm_nested.stdout in ['Y', '1', 'y']
             fail_msg: "Nested KVM is not enabled on the host. Please check kernel parameters."
+
+
+    - name: Disable KVM halt polling
+      block:
+        - name: Ensure KVM halt polling is disabled persistently
+          copy:
+            dest: /etc/modprobe.d/kvm-halt-polling.conf
+            content: "options kvm halt_poll_ns=0\n"
+            owner: root
+            group: root
+            mode: '0644'
+          become: yes
+        - name: Apply KVM halt polling setting for the running kernel
+          copy:
+            dest: /sys/module/kvm/parameters/halt_poll_ns
+            content: "0\n"
+          failed_when: false
+          become: yes
 
     - name: Ensure local lab directory exists for keys and configs
       file:
@@ -80,12 +102,13 @@
         --name {{ vm_name }}
         --memory 32768
         --vcpus 4
+        --autostart
         --cpu host-passthrough
         --disk path={{ disk_path }},bus=virtio,size=40,format=qcow2
         --cdrom {{ iso_path }}
         --os-variant linux2022
-        --network default
-        --network type=direct,source={{ phys_nic }},source_mode=bridge,model=virtio
+        --network network=default,model=virtio,mac={{ mac_mgmt }}
+        --network type=direct,source={{ phys_nic }},source_mode=bridge,model=virtio,mac={{ mac_data }}
         --graphics none
         --noautoconsole
       become: yes
@@ -144,6 +167,14 @@
           loop:
             - endpoint
             - node
+
+        - name: Ensure Talos API is ready
+          wait_for:
+            host: "{{ vm_ip }}"
+            port: 50000
+            state: started
+            delay: 5
+            timeout: 120
 
         - name: Apply configuration (Flashes OS to disk)
           command: "talosctl apply-config --insecure --nodes {{ vm_ip }} --file controlplane.yaml"
@@ -219,8 +250,9 @@
             --set cgroup.hostRoot=/sys/fs/cgroup
             --set k8sServiceHost=localhost
             --set k8sServicePort=7445
-            --set devices="{eth0,eth1}"
-            --set directRoutingDevice=eth0
+            --set devices="{ {{ iface_mgmt }}, {{ iface_data }} }"
+            --set directRoutingDevice={{ iface_mgmt }}
+            --set l2announcements.enabled=true
           register: cilium_install
           changed_when: "'Release \"cilium\" does not exist. Installing it now.' in cilium_install.stdout or 'has been upgraded' in cilium_install.stdout"
 
@@ -237,3 +269,10 @@
           environment:
             KUBECONFIG: "{{ lab_dir }}/kubeconfig"
           changed_when: false
+
+    - name: Deploy some basic cluster resources
+      command: "kubectl apply -f {{ lab_dir }}/k8s"
+      environment:
+        KUBECONFIG: "{{ lab_dir }}/kubeconfig"
+      changed_when: false
+
