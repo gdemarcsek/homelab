@@ -8,6 +8,7 @@ spec:
   egressDeny:
   - toCIDR:
     - "192.168.1.0/24" # Home LAN subnet. Packets destined here will be dropped.
+    - "192.168.88.0/24"
   # Note: We don't need to specify an 'egress' allow list here. 
   # Cilium will allow cluster and internet traffic by default, but strictly deny the CIDR above.
 

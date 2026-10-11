@@ -10,7 +10,7 @@
     iso_path: "/var/lib/libvirt/images/{{ vm_name }}.iso"
     disk_path: "/var/lib/libvirt/images/{{ vm_name }}.qcow2"
     phys_nic: "{{ ansible_default_ipv4.interface }}"
-    lb_ip_pool: "192.168.1.240/29"
+    #lb_ip_pool: "192.168.1.240/29"
     mac_mgmt: "52:54:00:00:00:01"
     mac_data: "52:54:00:00:00:02"
     iface_mgmt: "enx525400000001"
