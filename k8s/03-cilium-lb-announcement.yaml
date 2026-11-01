@@ -4,8 +4,8 @@ metadata:
   name: home-network-pool
 spec:
   blocks:
-    - start: "10.50.50.200"
-      stop: "10.50.50.220"
+    - start: "10.50.40.200"
+      stop: "10.50.40.220"
 ---
 apiVersion: "cilium.io/v2alpha1"
 kind: CiliumL2AnnouncementPolicy

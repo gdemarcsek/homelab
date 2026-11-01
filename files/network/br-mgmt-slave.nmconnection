@@ -1,0 +1,11 @@
+[connection]
+id=br-mgmt-slave
+uuid=a0103569-dd6e-4801-b7b8-d95e9d4c1be7
+type=ethernet
+controller=br-mgmt
+interface-name=enp89s0
+port-type=bridge
+
+[ethernet]
+
+[bridge-port]

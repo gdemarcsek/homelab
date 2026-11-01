@@ -41,10 +41,13 @@ Kubernetes Control Plane and Data Plane isolation on the architecture level
    - Change Zyxel Port 8 from Access PVID 50 to Trunk (VLAN 40 Tagged, VLAN 50 Tagged).
    - Create Linux bridges on Fedora (`br-mgmt` on VLAN 40, `br-data` on VLAN 50).
    - Eliminate libvirt NAT (`network=default`) and `macvtap` so Control Plane is directly routable from LAN via VLAN 40 (`10.50.40.0/24`).
-2. **Remote Ingress**:
+2. **Multi-node cluster**: Deploy 3 KVM instances of Talos to build a multi-node virtual cluster on the 64GB RAM NUC running Fedora Server. Each node should be given 18 GB of RAM and 4 to 6 vCPUs. Configure VM virtual disk cache to writeback.
+3. **Remote Ingress**:
    - Deploy `cloudflared` tunnel as a Kubernetes deployment on the NUC to proxy subdomains to internal LoadBalancer services.
-3. **IaC Transition**:
+4. **IaC Transition**:
    - Use Terraform with the `bpg/routeros` provider against the RouterOS REST API, backed by SOPS for secret management.
+5. **Service Mesh**:
+   - Add SPIFFE/SPIRE workload identity, back it with TPM, install a service mesh and improve telemetry. Use ACME for auto TLS and ensure services have domain names to use locally.
 
 ## Network Map
 

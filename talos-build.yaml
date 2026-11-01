@@ -15,6 +15,7 @@
     mac_data: "52:54:00:00:00:02"
     iface_mgmt: "enx525400000001"
     iface_data: "enx525400000002"
+    vm_ip: "10.50.50.10"
   tasks:
     - name: Pre-flight Sanity Checks
       block:
@@ -34,6 +35,30 @@
             fail_msg: "Nested KVM is not enabled on the host. Please check kernel parameters."
 
 
+    - name: Ensure 802.1Q VLAN module is loaded on boot
+      copy:
+        dest: /etc/modules-load.d/8021q.conf
+        content: "8021q\n"
+        owner: root
+        group: root
+        mode: '0644'
+      become: yes
+
+    - name: Load 802.1Q module into running kernel
+      modprobe:
+        name: 8021q
+        state: present
+      become: yes
+    
+    - name: Disable WiFi on next reboot
+      copy:
+        dest: /etc/modprobe.d/disable-wifi.conf
+        content: "blacklist iwlmvm\nblacklist iwlwifi\n"
+        owner: root
+        group: root
+        mode: '0644'
+      become: yes
+
     - name: Disable KVM halt polling
       block:
         - name: Ensure KVM halt polling is disabled persistently
@@ -50,6 +75,27 @@
             content: "0\n"
           failed_when: false
           become: yes
+
+    - name: Deploy NetworkManager bridge and VLAN profiles
+      copy:
+        src: "files/network/{{ item }}"
+        dest: "/etc/NetworkManager/system-connections/{{ item }}"
+        owner: root
+        group: root
+        mode: '0600'
+      loop:
+        - br-mgmt.nmconnection
+        - br-mgmt-slave.nmconnection
+        - br-data.nmconnection
+        - vlan40.nmconnection
+      notify: Reload NetworkManager
+      become: yes
+
+    - name: Ensure default legacy ethernet profile does not autoconnect
+      command: nmcli connection modify "Wired connection 1" autoconnect no
+      failed_when: false
+      changed_when: false
+      become: yes
 
     - name: Ensure local lab directory exists for keys and configs
       file:
@@ -107,27 +153,27 @@
         --disk path={{ disk_path }},bus=virtio,size=40,format=qcow2
         --cdrom {{ iso_path }}
         --os-variant linux2022
-        --network network=default,model=virtio,mac={{ mac_mgmt }}
-        --network type=direct,source={{ phys_nic }},source_mode=bridge,model=virtio,mac={{ mac_data }}
+        --network bridge=br-mgmt,model=virtio,mac={{ mac_mgmt }}
+        --network bridge=br-data,model=virtio,mac={{ mac_data }}
         --graphics none
         --noautoconsole
       become: yes
       when: vm_state.rc != 0
 
-    - name: Wait for VM to boot and acquire an IP address
-      shell: |
-        MAC=$(virsh domiflist {{ vm_name }} | awk '/default/ {print $5}')
-        virsh net-dhcp-leases default | grep -i "$MAC" | awk '{print $5}' | cut -d/ -f1
-      register: vm_ip_cmd
-      until: vm_ip_cmd.stdout != ""
-      retries: 30
-      delay: 5
-      become: yes
-      changed_when: false
+    #- name: Wait for VM to boot and acquire an IP address
+    #  shell: |
+    #    MAC=$(virsh domiflist {{ vm_name }} | awk '/default/ {print $5}')
+    #    virsh net-dhcp-leases default | grep -i "$MAC" | awk '{print $5}' | cut -d/ -f1
+    #  register: vm_ip_cmd
+    #  until: vm_ip_cmd.stdout != ""
+    #  retries: 30
+    #  delay: 5
+    #  become: yes
+    #  changed_when: false
 
-    - name: Capture VM IP Address
-      set_fact:
-        vm_ip: "{{ vm_ip_cmd.stdout }}"
+    #- name: Capture VM IP Address
+    #  set_fact:
+    #    vm_ip: "{{ vm_ip_cmd.stdout }}"
 
     - name: Check if cryptographic keys already exist
       stat:
@@ -149,6 +195,14 @@
                 proxy:
                   disabled: true
               machine:
+                network:
+                  interfaces:
+                    - interface: {{ iface_mgmt }}
+                      dhcp: true
+                    - interface: {{ iface_data }}
+                      dhcp: true
+                      dhcpOptions:
+                        routeMetric: 2048
                 install:
                   disk: /dev/vda
                   image: factory.talos.dev/installer/{{ factory_id }}:{{ talos_version }}
@@ -235,7 +289,7 @@
           command: helm repo update
           changed_when: false
 
-        - name: Install Cilium via Helm
+        - name: Install Cilium via Helm (replica count 1 for a single node cluster)
           command: >
             helm upgrade --install cilium cilium/cilium
             --version 1.16.1
@@ -243,6 +297,7 @@
             --create-namespace
             --kubeconfig {{ lab_dir }}/kubeconfig
             --set ipam.mode=kubernetes
+            --set operator.replicas=1
             --set kubeProxyReplacement=true
             --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}"
             --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}"
@@ -276,3 +331,7 @@
         KUBECONFIG: "{{ lab_dir }}/kubeconfig"
       changed_when: false
 
+  handlers:
+    - name: Reload NetworkManager
+      ansible.builtin.command: nmcli connection reload
+      become: yes

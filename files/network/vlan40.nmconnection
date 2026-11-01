@@ -1,0 +1,16 @@
+[connection]
+id=vlan40
+uuid=da9001c4-7d1c-4504-bcfd-1a5ad81d9bb5
+type=vlan
+controller=br-data
+interface-name=enp89s0.40
+port-type=bridge
+
+[ethernet]
+
+[vlan]
+flags=1
+id=40
+parent=enp89s0
+
+[bridge-port]
